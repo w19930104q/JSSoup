@@ -875,6 +875,206 @@ describe('replaceWith', function() {
   });
 });
 
+describe('node movement integrity', function() {
+  // Walk the whole tree and assert every structural invariant:
+  //  - contents[i].parent === owner
+  //  - nextElement/previousElement form a reciprocal, cycle-free chain
+  //  - the chain visits every descendant exactly once (no overlaps)
+  function assertIntegrity(root) {
+    var treeSet = new Set();
+    (function walk(node) {
+      assert.ok(!treeSet.has(node), 'cycle detected in contents');
+      treeSet.add(node);
+      (node.contents || []).forEach(function(child) {
+        assert.equal(child.parent, node, 'parent pointer mismatch');
+        walk(child);
+      });
+    })(root);
+
+    var chain = new Set();
+    var cur = root.nextElement;
+    var prev = root;
+    while (cur) {
+      assert.ok(!chain.has(cur), 'duplicate node in nextElement chain');
+      chain.add(cur);
+      assert.equal(cur.previousElement, prev, 'previousElement broken');
+      assert.equal(prev.nextElement, cur, 'nextElement broken');
+      prev = cur;
+      cur = cur.nextElement;
+    }
+
+    var expected = treeSet.size - 1; // exclude root itself
+    assert.equal(chain.size, expected, 'chain does not cover all descendants');
+    assert.equal(root.descendants.length, expected, 'descendants count mismatch');
+  }
+
+  it('moves a node between two documents without breaking either tree', function(done) {
+    var sourceHtml = '<div><p id="p1">p1</p><p id="p2">p2</p><p id="p3">p3</p></div>';
+    var targetHtml = '<section><h1>title</h1><h2>subtitle</h2></section>';
+    var fromSoup = new JSSoup(sourceHtml);
+    var toSoup = new JSSoup(targetHtml);
+
+    var p2 = fromSoup.find('p', {id: 'p2'});
+    var section = toSoup.find('section');
+    section.insert(1, p2);
+
+    assert.equal(fromSoup.prettify('', ''), '<div><p id="p1">p1</p><p id="p3">p3</p></div>');
+    assert.equal(toSoup.prettify('', ''),
+      '<section><h1>title</h1><p id="p2">p2</p><h2>subtitle</h2></section>');
+    // the moved node appears exactly once, in the target document only
+    assert.equal(fromSoup.findAll('p').map(function(p) { return p.attrs.id; }).join(','), 'p1,p3');
+    assert.equal(toSoup.findAll('p').map(function(p) { return p.attrs.id; }).join(','), 'p2');
+    assert.equal(p2.parent, section);
+    assertIntegrity(fromSoup);
+    assertIntegrity(toSoup);
+    done();
+  });
+
+  it('moves every top level node when inserting a whole JSSoup', function(done) {
+    var fromSoup = new JSSoup('<a>1</a><b>2</b><c>3</c>');
+    var toSoup = new JSSoup('<div><span>s</span></div>');
+    var div = toSoup.find('div');
+
+    div.insert(100, fromSoup);
+
+    assert.equal(toSoup.prettify('', ''),
+      '<div><span>s</span><a>1</a><b>2</b><c>3</c></div>');
+    assert.equal(fromSoup.contents.length, 0);
+    assertIntegrity(fromSoup);
+    assertIntegrity(toSoup);
+    done();
+  });
+
+  it('rejects a cross-document move that would cycle without modifying anything', function(done) {
+    var fromSoup = new JSSoup('<a>1</a><b>2</b>');
+    var toSoup = new JSSoup('<div><p>text</p></div>');
+    var beforeFrom = fromSoup.prettify('', '');
+    var beforeTo = toSoup.prettify('', '');
+    var a = fromSoup.find('a');
+    var p = toSoup.find('p');
+
+    // a foreign node cannot cycle; use an ancestor inside the target document
+    expect(function() { p.insert(0, toSoup.find('div')); }).to.throw();
+    expect(function() { p.replaceWith(toSoup.find('div')); }).to.throw();
+    // the foreign node must still be fully attached
+    expect(function() { toSoup.find('p').insert(0, 42); }).to.throw();
+
+    assert.equal(fromSoup.prettify('', ''), beforeFrom);
+    assert.equal(toSoup.prettify('', ''), beforeTo);
+    assert.equal(a.parent, fromSoup);
+    assertIntegrity(fromSoup);
+    assertIntegrity(toSoup);
+    done();
+  });
+
+  it('rejects replacing a node with its ancestor and leaves the document intact', function(done) {
+    var soup = new JSSoup('<div><p id="p1"><b>bold</b></p><p id="p2">p2</p></div>');
+    var before = soup.prettify('', '');
+    var b = soup.find('b');
+    var p1 = soup.find('p', {id: 'p1'});
+    var div = soup.find('div');
+
+    expect(function() { b.replaceWith(div); }).to.throw();
+    expect(function() { b.replaceWith(p1); }).to.throw();
+    expect(function() { b.insert(0, div); }).to.throw();
+    expect(function() { p1.replaceWith(div); }).to.throw();
+    // the original message for the direct parent is preserved
+    expect(function() { p1.replaceWith(div); }).to.throw('Cannot replace element with its parent!');
+
+    assert.equal(soup.prettify('', ''), before);
+    assert.equal(b.parent, p1);
+    assertIntegrity(soup);
+    done();
+  });
+
+  it('rejects inserting the document root into one of its descendants', function(done) {
+    var soup = new JSSoup('<div><p><b>x</b></p></div>');
+    var before = soup.prettify('', '');
+    var b = soup.find('b');
+
+    expect(function() { b.insert(0, soup); }).to.throw();
+    assert.equal(soup.prettify('', ''), before);
+    assert.equal(soup.contents.length, 1);
+    assertIntegrity(soup);
+    done();
+  });
+
+  it('keeps replaceWith atomic when the replacement is invalid', function(done) {
+    var soup = new JSSoup('<div><p id="p1">p1</p><p id="p2">p2</p></div>');
+    var before = soup.prettify('', '');
+    var p1 = soup.find('p', {id: 'p1'});
+
+    expect(function() { p1.replaceWith(null); }).to.throw();
+    expect(function() { p1.replaceWith(42); }).to.throw();
+
+    assert.equal(soup.prettify('', ''), before);
+    assert.equal(p1.parent, soup.find('div'));
+    assertIntegrity(soup);
+    done();
+  });
+
+  it('moves and replaces string nodes while keeping the traversal chain consistent', function(done) {
+    var soup = new JSSoup('<div><p>hello</p><p>world</p></div>');
+    var div = soup.find('div');
+    var hello = div.contents[0].contents[0];
+
+    // moving an existing string node, inserting new strings and extracting one
+    div.insert(1, hello);
+    div.insert(2, 'X');
+    var inserted = div.contents[2];
+    inserted.replaceWith('Y');
+
+    assert.equal(div.prettify('', ''), '<div><p></p>helloY<p>world</p></div>');
+    assert.equal(soup.getText(), 'helloYworld');
+    assertIntegrity(soup);
+
+    // replaceWith on a string node itself
+    var world = soup.find(undefined, undefined, 'world');
+    world.replaceWith('earth');
+    assert.equal(soup.getText(), 'helloYearth');
+    assertIntegrity(soup);
+    done();
+  });
+
+  it('keeps the tree consistent through a sequence of mixed changes', function(done) {
+    var soup = new JSSoup('<div><a>1</a><b>2</b><c>3</c><d>4</d></div>');
+    var div = soup.find('div');
+    var a = soup.find('a');
+    var b = soup.find('b');
+    var c = soup.find('c');
+    var d = soup.find('d');
+
+    div.insert(100, a);     // move a to the end
+    div.insert(0, d);       // move d to the front
+    b.extract();            // remove b
+    div.insert(1, b);       // put b back in the middle
+    c.replaceWith('three'); // replace a tag with a string
+
+    assert.equal(div.prettify('', ''),
+      '<div><d>4</d><b>2</b>three<a>1</a></div>');
+    assert.equal(soup.getText(), '42three1');
+    assert.deepEqual(soup.select('*').map(function(n) { return n.name; }),
+      ['div', 'd', 'b', 'a']);
+    assertIntegrity(soup);
+    done();
+  });
+
+  it('supports a full cross-document replaceWith', function(done) {
+    var fromSoup = new JSSoup('<div><a>1</a><b>2</b></div>');
+    var toSoup = new JSSoup('<section><h1>h</h1><h2>j</h2></section>');
+    var h1 = toSoup.find('h1');
+    var aTag = fromSoup.find('a');
+
+    h1.replaceWith(aTag);
+
+    assert.equal(fromSoup.prettify('', ''), '<div><b>2</b></div>');
+    assert.equal(toSoup.prettify('', ''), '<section><a>1</a><h2>j</h2></section>');
+    assertIntegrity(fromSoup);
+    assertIntegrity(toSoup);
+    done();
+  });
+});
+
 describe('select', function() {
   it('should select expected elements with combinators', function(done) {
     var soup = new JSSoup(data);
